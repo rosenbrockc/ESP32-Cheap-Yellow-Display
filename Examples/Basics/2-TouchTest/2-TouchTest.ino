@@ -39,6 +39,7 @@
 
 #include "SD.h"
 #include "Audio.h"
+#include "ESP32Time.h"
 
 // ----------------------------
 // Touch Screen pins
@@ -57,45 +58,50 @@
 
 SPIClass mySpi = SPIClass(VSPI);
 XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+ESP32Time etime = ESP32Time();
 
 TFT_eSPI tft = TFT_eSPI();
 
-uint8_t n_home = 3
-uint8_t n_dryness = 5;
-uint8_t n_settings = 4;
-uint8_t n_temperature = 6;
-uint8_t n_humidity = 6;
+#include "support_functions.h"
+
+const uint8_t n_home = 3;
+const uint8_t n_dryness = 5;
+const uint8_t n_settings = 4;
+const uint8_t n_temperature = 6;
+const uint8_t n_humidity = 6;
+const uint8_t n_completed = 2;
 
 TFT_eSPI_Button btn_home[n_home];
 TFT_eSPI_Button btn_dryness[n_dryness];
 TFT_eSPI_Button btn_settings[n_settings];
 TFT_eSPI_Button btn_temperature[n_temperature];
 TFT_eSPI_Button btn_humidity[n_humidity];
+TFT_eSPI_Button btn_completed[n_completed];
 
-Audio audio(true, I2S_DAC_CHANNEL_LEFT_EN);
+// Audio audio(true, I2S_DAC_CHANNEL_LEFT_EN);
 
-static readonly string[] lbl_home = { "Lighting", "Biltong Timer", "Settings" };
-static readonly string[] lbl_dryness = { "Wet", "Medium", "Dry", "Karoo Dry", "Home" };
-static readonly string[] lbl_settings = { "Temperature", "Humidity", "Wifi", "Home" };
-static readonly string[] lbl_temperature = { "^", "v", "^", "v", "Default", "Save" };
-static readonly string[] lbl_humidity = { "^", "v", "^", "v", "Default", "Save" };
+static const char* const lbl_home[] = { "Lighting", "Biltong Timer", "Settings" };
+static const char* const lbl_dryness[] = { "Wet", "Medium", "Dry", "Karoo Dry", "Home" };
+static const char* const lbl_settings[] = { "Temperature", "Humidity", "Wifi", "Home" };
+static const char* const lbl_temperature[] = { "^", "v", "^", "v", "Default", "Save" };
+static const char* const lbl_humidity[] = { "^", "v", "^", "v", "Default", "Save" };
+static const char* const lbl_completed[] = { "+12 Hours", "Finish" };
 
 // The timing for the different dryness levels of the biltong.
-static readonly float[] dryness_timing = { 48.0, 60.0, 84.0, 96.0 };
+static const float dryness_timing[] = { 48.0, 60.0, 84.0, 96.0 };
 
 uint16_t bWidth = TFT_HEIGHT/3;
 uint16_t bHeight = TFT_WIDTH/2;
 
 unsigned long last_touch = 0;
-unsigned long last_timing_update = 0;
 unsigned long last_timing_start = 0;
 unsigned long last_refresh = 0;
 float current_total_timing = 0.0;
 
-static readonly float DEFAULT_TEMPERATURE_MIN = 30.0;
-static readonly float DEFAULT_TEMPERATURE_MAX = 33.0;
-static readonly float DEFAULT_HUMIDITY_MIN = 50.0;
-static readonly float DEFAULT_HUMIDITY_MAX = 80.0;
+static const float DEFAULT_TEMPERATURE_MIN = 30.0;
+static const float DEFAULT_TEMPERATURE_MAX = 33.0;
+static const float DEFAULT_HUMIDITY_MIN = 50.0;
+static const float DEFAULT_HUMIDITY_MAX = 80.0;
 
 float temperature_min = DEFAULT_TEMPERATURE_MIN;
 float temperature_max = DEFAULT_TEMPERATURE_MAX;
@@ -112,15 +118,16 @@ int fontSize = 2;
 Enum defining which of the menu screens we are on; affects the button selections
 and corresponding event handling.
 */
-enum DumeniMenu {
-  HOME,
-  DRYNESS,
-  SETTINGS,
-  TEMPERATURE,
-  HUMIDITIY
-}
+typedef enum DumeniMenu {
+  HOME = 0,
+  DRYNESS = 1,
+  SETTINGS = 2,
+  TEMPERATURE = 3,
+  HUMIDITIY = 4,
+  COMPLETED = 5
+} Menu;
 
-enum DumeniMenu active_screen = HOME;
+Menu active_screen;
 
 #define LCD_BACK_LIGHT_PIN 21
 // use first channel of 16 channels (started from zero)
@@ -141,7 +148,7 @@ void ledcAnalogWrite(uint8_t channel, uint32_t value, uint32_t valueMax = 255) {
 }
 
 void initialize_sd() {
-  if (!SD.begin(SS, spi, 80000000)) {
+  if (!SD.begin(SS, mySpi, 80000000)) {
     Serial.println("Card Mount Failed");
     return;
   }
@@ -168,20 +175,18 @@ void initialize_sd() {
 
 }
 
-void readFile(fs::FS &fs, const char * path) {
+String readFile(fs::FS &fs, const char * path) {
   Serial.printf("Reading file: %s\n", path);
 
   File file = fs.open(path);
   if (!file) {
     Serial.println("Failed to open file for reading");
-    return;
+    return "";
   }
 
-  Serial.print("Read from file: ");
-  while (file.available()) {
-    Serial.write(file.read());
-  }
+  String result = file.readString();
   file.close();
+  return result;
 }
 
 void writeFile(fs::FS &fs, const char * path, const char * message) {
@@ -210,7 +215,7 @@ void draw_dryness_buttons() {
   // Generate buttons with different size X deltas
   for (int i = 0; i < n_dryness; i++) {
     uint16_t btn_index = i;
-    if i == 4 {
+    if (i == 4) {
       // Leave a gap between the dryness buttons and the final home button.
       btn_index += 1;
     }
@@ -243,16 +248,21 @@ void dryness_menu_click() {
 Button click handler for the various biltong dryness buttons.
 */
 void dryness_button_handler(uint8_t index) {
-  if index == 4 {
+  if (index == 4) {
     // Home
     home_menu_click();
     return;
   }
 
   current_total_timing = dryness_timing[index];
-  writeFile(SD, "/timing.txt", String(current_total_timing));
-  last_timing_update = getLocalEpoch();
-  writeFile(SD, "/lastrun.txt", String(last_timing_update));
+  char *stime;
+  sprintf(stime, "%d", current_total_timing);
+  writeFile(SD, "/timing.txt", stime);
+
+  last_timing_start = etime.getLocalEpoch();
+  char *sstart;
+  sprintf(sstart, "%d", last_timing_start);
+  writeFile(SD, "/lastrun.txt", sstart);
 }
 
 void lighting_button_click(bool on) {
@@ -271,24 +281,24 @@ void draw_temperature_buttons() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
-  uint8_t[] xs = { 130, 130, 290, 290, 80, 240 };
-  uint8_t[] ys = { 90, 150, 90, 150, 220, 220 };
+  uint8_t xs[] = { 130, 130, 290, 290, 80, 240 };
+  uint8_t ys[] = { 90, 150, 90, 150, 220, 220 };
   uint8_t width = 30;
   uint8_t height = 30;
 
   // Generate buttons with different size X deltas
   for (int i = 0; i < n_temperature; i++) {
     uint16_t btn_index = i;
-    if i > 3 {
+    if (i > 3) {
       // Make the Default/Save buttons wider.
       width = 60;
     }
 
     btn_temperature[i].initButton(&tft,
                       xs[i],
-                      ys[i]
+                      ys[i],
                       width,
-                      width,
+                      height,
                       TFT_BLACK, // Outline
                       TFT_BLUE, // Fill
                       TFT_BLACK, // Text
@@ -328,7 +338,7 @@ void set_temperature_mosfet() {
 void save_tempearature() {
   char *s;
   sprintf(s, "%f,%f", temperature_min, temperature_max);
-  writeFile(SD, "/temperature.txt", );
+  writeFile(SD, "/temperature.txt", s);
   set_temperature_mosfet();
 }
 
@@ -340,28 +350,28 @@ void temperature_button_handler(uint8_t index) {
     case 0:
       // Temperature Min Up
       temperature_min += 0.5;
-      if temperature_min > temperature_max; {
+      if (temperature_min > temperature_max) {
         temperature_min = temperature_max;
       }
       break;
     case 1:
       // Temperature Min Down
       temperature_min -= 0.5;
-      if temperature_min < 1.0: {
+      if (temperature_min < 1.0) {
         temperature_min = 1.0;
       }
       break;
     case 2:
       // Temperature Max Up
       temperature_max += 0.5;
-      if temperature_min > 40.0: {
+      if (temperature_min > 40.0) {
         temperature_min = 40.0;
       }
       break;
     case 3:
       // Temperature Max Down
       temperature_max -= 0.5;
-      if temperature_min < temperature_min: {
+      if (temperature_min < temperature_min) {
         temperature_min = temperature_min;
       }
       break;
@@ -393,22 +403,22 @@ void draw_humidity_buttons() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
-  uint8_t[] xs = { 130, 130, 290, 290, 80, 240 };
-  uint8_t[] ys = { 90, 150, 90, 150, 220, 220 };
+  uint8_t xs[] = { 130, 130, 290, 290, 80, 240 };
+  uint8_t ys[] = { 90, 150, 90, 150, 220, 220 };
   uint8_t width = 30;
   uint8_t height = 30;
 
   // Generate buttons with different size X deltas
   for (int i = 0; i < n_humidity; i++) {
     uint16_t btn_index = i;
-    if i > 3 {
+    if (i > 3) {
       // Make the Default/Save buttons wider.
       width = 60;
     }
 
     btn_humidity[i].initButton(&tft,
                       xs[i],
-                      ys[i]
+                      ys[i],
                       width,
                       height,
                       TFT_BLACK, // Outline
@@ -450,7 +460,7 @@ void set_humidity_mosfet() {
 void save_humidity() {
   char *s;
   sprintf(s, "%f,%f", humidity_min, humidity_max);
-  writeFile(SD, "/humidity.txt", );
+  writeFile(SD, "/humidity.txt", s);
   set_humidity_mosfet();
 }
 
@@ -462,28 +472,28 @@ void humidity_button_handler(uint8_t index) {
     case 0:
       // humidity Min Up
       humidity_min += 0.5;
-      if humidity_min > humidity_max; {
+      if (humidity_min > humidity_max) {
         humidity_min = humidity_max;
       }
       break;
     case 1:
       // humidity Min Down
       humidity_min -= 0.5;
-      if humidity_min < 10.0: {
+      if (humidity_min < 10.0) {
         humidity_min = 10.0;
       }
       break;
     case 2:
       // humidity Max Up
       humidity_max += 0.5;
-      if humidity_min > 80.0: {
+      if (humidity_min > 80.0) {
         humidity_min = 80.0;
       }
       break;
     case 3:
       // humidity Max Down
       humidity_max -= 0.5;
-      if humidity_min < humidity_min: {
+      if (humidity_min < humidity_min) {
         humidity_min = humidity_min;
       }
       break;
@@ -576,9 +586,12 @@ float get_humidity() {
 }
 
 void update_temperature() {
-  unsigned long current_time = getLocalEpoch();
-  if (current_time - last_refresh > 1) {
-    draw_home_buttons();
+  unsigned long current_time = etime.getLocalEpoch();
+  if (current_time - last_refresh > 30) {
+    if (active_screen == HOME) {
+      draw_home_buttons();
+    }
+    last_refresh = current_time;
   }
 }
 
@@ -607,8 +620,16 @@ void draw_home_buttons() {
 
   char *s;
   sprintf(s, "Temperature: %.1f    Humidity: %.1f", get_temperature(), get_humidity());
-  String label = String.strftime("%H:%M:%S", current_time);
-  tft.drawCentreString(String(s), center_x, center_y, fontSize);
+  tft.drawCentreString(String(s), center_x, 130, fontSize);
+
+  if (last_timing_start > 0) {
+    uint8_t hours = (uint8_t)(current_total_timing - (etime.getLocalEpoch() - last_timing_start)) / 60;
+    uint8_t minutes = (uint8_t)(current_total_timing - (etime.getLocalEpoch() - last_timing_start)) % 60;
+
+    char *remtime;
+    sprintf(remtime, "Remaining: %d:%d", hours, minutes);
+    tft.drawCentreString(String(remtime), center_x, 160, fontSize);
+  }
 }
 
 /*
@@ -648,7 +669,7 @@ flags on each button to keep track of pressed state.
 @param buttons the array of buttons for the active menu screen.
 @param n the number of buttons on the active screen.
 */
-void generic_touch_start(TS_Point p, TFT_eSPI_Button[] buttons, uint8_t n) {
+void generic_touch_start(TS_Point p, TFT_eSPI_Button buttons[], uint8_t n) {
   u_int16_t sx = (u_int16_t)((p.x - 200) / (3600.0 / TFT_HEIGHT));
   u_int16_t sy = (u_int16_t)((p.y - 200) / (3600.0 / TFT_WIDTH));
 
@@ -661,7 +682,7 @@ void generic_touch_start(TS_Point p, TFT_eSPI_Button[] buttons, uint8_t n) {
   }
 }
 
-void generic_touch_run(void (*handler)(uint8_t), TFT_eSPI_Button[] buttons, String[] labels, uint8_t n) {
+void generic_touch_run(void (*handler)(uint8_t), TFT_eSPI_Button buttons[], const char* const labels[], uint8_t n) {
   for (uint8_t b = 0; b < n; b++) {
     // If button was just pressed, redraw inverted button
     if (buttons[b].justPressed()) {
@@ -671,7 +692,7 @@ void generic_touch_run(void (*handler)(uint8_t), TFT_eSPI_Button[] buttons, Stri
 
     // If button was just released, redraw normal color button
     if (buttons[b].justReleased()) {
-      buttons[b].drawButton(false, labels[b]);
+      buttons[b].drawButton(false, String(labels[b]));
     }
   }
 }
@@ -679,7 +700,7 @@ void generic_touch_run(void (*handler)(uint8_t), TFT_eSPI_Button[] buttons, Stri
 /*
 Touch event handler when the active screen is the home screen.
 */
-void home_touch_handler() {
+void home_touch_handler(TS_Point p) {
   generic_touch_start(p, btn_home, n_home);
   generic_touch_run(home_button_handler, btn_home, lbl_home, n_home);
 }
@@ -687,7 +708,7 @@ void home_touch_handler() {
 /*
 Touch event handler when the active screen is the biltong dryness selection.
 */
-void dryness_touch_handler() {
+void dryness_touch_handler(TS_Point p) {
   generic_touch_start(p, btn_dryness, n_dryness);
   generic_touch_run(dryness_button_handler, btn_dryness, lbl_dryness, n_dryness);
 }
@@ -695,7 +716,7 @@ void dryness_touch_handler() {
 /*
 Touch event handler when the active screen is the settings selection.
 */
-void settings_touch_handler() {
+void settings_touch_handler(TS_Point p) {
   generic_touch_start(p, btn_settings, n_settings);
   generic_touch_run(settings_button_handler, btn_settings, lbl_settings, n_settings);
 }
@@ -703,7 +724,7 @@ void settings_touch_handler() {
 /*
 Touch event handler when the active screen is the temperature min/max screen.
 */
-void temperature_touch_handler() {
+void temperature_touch_handler(TS_Point p) {
   generic_touch_start(p, btn_temperature, n_temperature);
   generic_touch_run(temperature_button_handler, btn_temperature, lbl_temperature, n_temperature);
 }
@@ -711,38 +732,55 @@ void temperature_touch_handler() {
 /*
 Touch event handler when the active screen is the humidity min/max screen.
 */
-void humidity_touch_handler() {
+void humidity_touch_handler(TS_Point p) {
   generic_touch_start(p, btn_humidity, n_humidity);
   generic_touch_run(humidity_button_handler, btn_humidity, lbl_humidity, n_humidity);
 }
 
 void any_touch_handler() {
   if (ts.tirqTouched() && ts.touched()) {
-      last_touch = getLocalEpoch();
+      last_touch = etime.getLocalEpoch();
       ledcAnalogWrite(LEDC_CHANNEL_0, 255); // On full brightness
 
       TS_Point p = ts.getPoint();
 
       switch (active_screen) {
         case HOME:
-        home_touch_handler();
+        home_touch_handler(p);
           break;
         case DRYNESS:
-          dryness_touch_handler();
+          dryness_touch_handler(p);
           break;
         case SETTINGS:
-        settings_touch_handler();
+        settings_touch_handler(p);
           break;
         case TEMPERATURE:
-          temperature_touch_handler();
+          temperature_touch_handler(p);
           break;
         case HUMIDITIY:
-          humidity_touch_handler();
+          humidity_touch_handler(p);
           break;
       }
   }
 }
 
+
+void continue_cycle() {
+  // Continue the cycle from where it left off.
+  String timing = readFile(SD, "/timing.txt");
+  if (timing.length() > 0) {
+    current_total_timing = timing.toFloat();
+  }
+
+  String last = readFile(SD, "/lastrun.txt");
+  if (last.length() > 0) {
+    last_timing_start = (unsigned long)last.toInt();
+  }
+}
+
+void show_splash_logo() {
+  load_file(SD, "/logo.png");
+}
 
 void setup() {
   Serial.begin(115200);
@@ -766,15 +804,99 @@ void setup() {
 
   tft.setRotation(1); //This is the display in landscape
 
+  show_splash_logo();
+  delay(3000);
+
   // Clear the screen before writing to it
   tft.fillScreen(TFT_BLACK);
-  draw_home_buttons();
+
+  continue_cycle();
+  home_menu_click();
 }
 
 void dim_screen() {
-  unsigned long current_time = getLocalEpoch();
+  unsigned long current_time = etime.getLocalEpoch();
   if (current_time - last_touch > 30) {
     ledcAnalogWrite(LEDC_CHANNEL_0, 0); // Off
+  }
+}
+
+/* Draws the interface for selecting the biltong dryness to a cleared screen.
+*/
+void draw_completed_buttons() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  uint8_t xs[] = { 80, 240 };
+  uint8_t ys[] = { 120, 120 };
+
+  // Generate buttons with different size X deltas
+  for (int i = 0; i < n_completed; i++) {
+    uint16_t btn_index = i;
+    btn_completed[i].initButton(&tft,
+                      bWidth * (btn_index % 3) + bWidth/2,
+                      bHeight * (btn_index / 3) + bHeight/2,
+                      bWidth,
+                      bHeight,
+                      TFT_BLACK, // Outline
+                      TFT_BLUE, // Fill
+                      TFT_BLACK, // Text
+                      "",
+                      1);
+
+    btn_home[i].drawButton(false, lbl_completed[i]);
+  }
+}
+
+/*
+Button handler for the home menu button click. This button exists on all the
+sub-menus and returns the user to the home screen.
+*/
+void completed_menu_show() {
+  draw_completed_buttons();
+  active_screen = COMPLETED;
+}
+
+void turn_off_temperature_control() {
+  // Turn off the temperature control
+  // TODO: Implement this.
+  return;
+}
+
+/*
+Button click handler for the various biltong dryness buttons.
+*/
+void completed_button_handler(uint8_t index) {
+  switch (index) {
+    case 0:
+      // Add 12 Hours
+      current_total_timing += 12.0;
+      break;
+    case 1:
+      // Finish the cycle.
+      // Turn off the temperature/humidity control
+      turn_off_temperature_control();
+      break;
+  }
+  home_menu_click();
+}
+
+// void play_nkosi() {
+//   //audio.connecttohost();
+//   audio.setVolume(20);
+// }
+
+/*
+Checks whether the current biltong timing has been reached and if so, turns off
+the temperature/humidity control, plays a chime, etc.
+*/
+void is_timing_done() {
+  unsigned long current_time = etime.getLocalEpoch();
+  if (current_time - last_refresh > 60.0) {
+    unsigned long elapsed = current_time - last_timing_start;
+    if (current_time - last_timing_start > current_total_timing) {
+      completed_menu_show();
+    }
   }
 }
 
